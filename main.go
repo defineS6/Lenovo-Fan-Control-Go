@@ -27,29 +27,31 @@ const (
 
 	ioctlFanControl = 0x831020C0
 
-	defaultFastMs = 8090
-	defaultGapMs  = 10090
+	defaultFastMs          = 8090
+	defaultGapMs           = 10090
+	defaultTempPollSeconds = 30
 
 	modeNormal = iota
 	modePulse
 	modeThermal
 
-	thermalTriggerC  = 70.0
-	tempPollInterval = time.Minute
+	thermalTriggerC = 70.0
 )
 
 //go:embed res/icon.ico
 var iconData []byte
 
 type config struct {
-	FastMs     int `json:"fast_ms"`
-	PulseGapMs int `json:"pulse_gap_ms"`
+	FastMs          int `json:"fast_ms"`
+	PulseGapMs      int `json:"pulse_gap_ms"`
+	TempPollSeconds int `json:"temp_poll_seconds"`
 }
 
 type controller struct {
 	mu     sync.RWMutex
 	fastMs int
 	gapMs  int
+	pollS  int
 	mode   int
 	stopCh chan struct{}
 	tempC  float64
@@ -65,9 +67,14 @@ func newController(cfg config) *controller {
 	if gapMs < 0 {
 		gapMs = defaultGapMs
 	}
+	pollS := cfg.TempPollSeconds
+	if pollS <= 0 {
+		pollS = defaultTempPollSeconds
+	}
 	return &controller{
 		fastMs: fastMs,
 		gapMs:  gapMs,
+		pollS:  pollS,
 	}
 }
 
@@ -120,9 +127,20 @@ func (c *controller) setGap(gapMs int) {
 	c.mu.Lock()
 	c.gapMs = gapMs
 	fastMs := c.fastMs
+	pollS := c.pollS
 	c.mu.Unlock()
 
-	_ = saveConfig(config{FastMs: fastMs, PulseGapMs: gapMs})
+	_ = saveConfig(config{FastMs: fastMs, PulseGapMs: gapMs, TempPollSeconds: pollS})
+}
+
+func (c *controller) setTempPollSeconds(seconds int) {
+	c.mu.Lock()
+	c.pollS = seconds
+	fastMs := c.fastMs
+	gapMs := c.gapMs
+	c.mu.Unlock()
+
+	_ = saveConfig(config{FastMs: fastMs, PulseGapMs: gapMs, TempPollSeconds: seconds})
 }
 
 func (c *controller) setTemp(tempC float64, ok bool) {
@@ -132,10 +150,10 @@ func (c *controller) setTemp(tempC float64, ok bool) {
 	c.mu.Unlock()
 }
 
-func (c *controller) state() (fastMs int, gapMs int, mode int, tempC float64, tempOK bool) {
+func (c *controller) state() (fastMs int, gapMs int, pollS int, mode int, tempC float64, tempOK bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.fastMs, c.gapMs, c.mode, c.tempC, c.tempOK
+	return c.fastMs, c.gapMs, c.pollS, c.mode, c.tempC, c.tempOK
 }
 
 func (c *controller) pulseLoop(stopCh <-chan struct{}) {
@@ -147,7 +165,7 @@ func (c *controller) pulseLoop(stopCh <-chan struct{}) {
 		}
 		_ = fanControl(fanFast)
 
-		fastMs, gapMs, _, _, _ := c.state()
+		fastMs, gapMs, _, _, _, _ := c.state()
 		if waitOrStop(stopCh, time.Duration(fastMs)*time.Millisecond) {
 			return
 		}
@@ -178,7 +196,8 @@ func (c *controller) thermalLoop(stopCh <-chan struct{}) {
 			_ = fanControl(fanNormal)
 		}
 
-		if waitOrStop(stopCh, tempPollInterval) {
+		_, _, pollS, _, _, _ := c.state()
+		if waitOrStop(stopCh, time.Duration(pollS)*time.Second) {
 			return
 		}
 	}
@@ -275,24 +294,27 @@ func configPath() (string, error) {
 func loadConfig() config {
 	path, err := configPath()
 	if err != nil {
-		return config{FastMs: defaultFastMs, PulseGapMs: defaultGapMs}
+		return config{FastMs: defaultFastMs, PulseGapMs: defaultGapMs, TempPollSeconds: defaultTempPollSeconds}
 	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return config{FastMs: defaultFastMs, PulseGapMs: defaultGapMs}
+		return config{FastMs: defaultFastMs, PulseGapMs: defaultGapMs, TempPollSeconds: defaultTempPollSeconds}
 	}
 	if err != nil {
-		return config{FastMs: defaultFastMs, PulseGapMs: defaultGapMs}
+		return config{FastMs: defaultFastMs, PulseGapMs: defaultGapMs, TempPollSeconds: defaultTempPollSeconds}
 	}
 	var cfg config
 	if json.Unmarshal(data, &cfg) != nil {
-		return config{FastMs: defaultFastMs, PulseGapMs: defaultGapMs}
+		return config{FastMs: defaultFastMs, PulseGapMs: defaultGapMs, TempPollSeconds: defaultTempPollSeconds}
 	}
 	if cfg.FastMs <= 0 {
 		cfg.FastMs = defaultFastMs
 	}
 	if cfg.PulseGapMs < 0 {
 		cfg.PulseGapMs = defaultGapMs
+	}
+	if cfg.TempPollSeconds <= 0 {
+		cfg.TempPollSeconds = defaultTempPollSeconds
 	}
 	return cfg
 }
@@ -313,6 +335,12 @@ func saveConfig(cfg config) error {
 }
 
 type gapPreset struct {
+	title string
+	value int
+	item  *systray.MenuItem
+}
+
+type pollPreset struct {
 	title string
 	value int
 	item  *systray.MenuItem
@@ -347,19 +375,28 @@ func onReady(ctrl *controller) {
 	}
 
 	systray.AddSeparator()
+	pollPresets := []*pollPreset{
+		{title: "温度轮询 30 秒", value: 30},
+		{title: "温度轮询 60 秒", value: 60},
+	}
+	for _, preset := range pollPresets {
+		preset.item = systray.AddMenuItem(preset.title, "设置温控模式的温度读取间隔")
+	}
+
+	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("退出", "退出并恢复正常控制")
 
 	updateTemperature(ctrl)
-	updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets)
+	updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets, pollPresets)
 	ctrl.startThermal()
-	updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets)
+	updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets, pollPresets)
 
 	go func() {
-		ticker := time.NewTicker(tempPollInterval)
+		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			updateTemperature(ctrl)
-			updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets)
+			updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets, pollPresets)
 		}
 	}()
 
@@ -368,15 +405,15 @@ func onReady(ctrl *controller) {
 			select {
 			case <-mPulse.ClickedCh:
 				ctrl.startPulse()
-				updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets)
+				updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets, pollPresets)
 
 			case <-mThermal.ClickedCh:
 				ctrl.startThermal()
-				updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets)
+				updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets, pollPresets)
 
 			case <-mNormal.ClickedCh:
 				ctrl.stopControl()
-				updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets)
+				updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets, pollPresets)
 
 			case <-mQuit.ClickedCh:
 				ctrl.stopControl()
@@ -391,7 +428,17 @@ func onReady(ctrl *controller) {
 		go func() {
 			for range p.item.ClickedCh {
 				ctrl.setGap(p.value)
-				updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets)
+				updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets, pollPresets)
+			}
+		}()
+	}
+
+	for _, preset := range pollPresets {
+		p := preset
+		go func() {
+			for range p.item.ClickedCh {
+				ctrl.setTempPollSeconds(p.value)
+				updateMenu(ctrl, status, mPulse, mThermal, mNormal, presets, pollPresets)
 			}
 		}()
 	}
@@ -402,8 +449,8 @@ func updateTemperature(ctrl *controller) {
 	ctrl.setTemp(tempC, ok)
 }
 
-func updateMenu(ctrl *controller, status, mPulse, mThermal, mNormal *systray.MenuItem, presets []*gapPreset) {
-	fastMs, gapMs, mode, tempC, tempOK := ctrl.state()
+func updateMenu(ctrl *controller, status, mPulse, mThermal, mNormal *systray.MenuItem, presets []*gapPreset, pollPresets []*pollPreset) {
+	fastMs, gapMs, pollS, mode, tempC, tempOK := ctrl.state()
 	tempText := "温度：读取失败"
 	if tempOK {
 		tempText = fmt.Sprintf("温度：%.1f°C", tempC)
@@ -417,7 +464,7 @@ func updateMenu(ctrl *controller, status, mPulse, mThermal, mNormal *systray.Men
 		mThermal.Uncheck()
 		mNormal.Uncheck()
 	case modeThermal:
-		status.SetTitle(fmt.Sprintf("状态：温控模式 | %s | 70°C 以上高转 %d 毫秒", tempText, defaultFastMs))
+		status.SetTitle(fmt.Sprintf("状态：温控模式 | %s | 每 %d 秒读取 | 70°C 以上高转 %d 毫秒", tempText, pollS, defaultFastMs))
 		mPulse.Uncheck()
 		mThermal.Check()
 		mNormal.Uncheck()
@@ -430,6 +477,14 @@ func updateMenu(ctrl *controller, status, mPulse, mThermal, mNormal *systray.Men
 
 	for _, preset := range presets {
 		if preset.value == gapMs {
+			preset.item.Check()
+		} else {
+			preset.item.Uncheck()
+		}
+	}
+
+	for _, preset := range pollPresets {
+		if preset.value == pollS {
 			preset.item.Check()
 		} else {
 			preset.item.Uncheck()
